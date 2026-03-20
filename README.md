@@ -1,22 +1,22 @@
 # Scalpel
 
-`Scalpel` 是一个用于代码瘦身的 skill。
+`Scalpel` 是一个面向 agent 的代码库 AST 分析 skill。
 
 仓库结构按常见 skill 约定组织在 `skills/Scalpel` 下。
 
 仓库现在分成两层：
 
 - [skills/Scalpel/SKILL.md](/Users/c.chen/dev/scalpel/skills/Scalpel/SKILL.md)，定义何时触发以及如何使用
-- `skills/Scalpel/scripts/scalpel`：已编译的 Rust 扫描器，可直接执行
+- `skills/Scalpel/scripts/scalpel`：已编译的 Rust 分析器，可直接执行
 - `tools/scalpel-cli`：Rust 源码项目，仅用于维护和构建，不跟随 skill 一起安装
 
 ## 能力范围
 
 - 扫描指定目录中的常见代码文件
-- 识别完全重复或归一化后重复的文件
-- 识别达到阈值的重复代码片段
-- 识别文件内部的样板冗余热点
-- 生成 Markdown 或 JSON 报告
+- 对已支持语言做 AST 解析
+- 输出文件级基础事实：语言、解析状态、顶层节点、符号、导入、导出、调用、诊断
+- 输出适合 agent 消费的 Markdown 或 JSON 结构化报告
+- 在 `derived` 视图中附带完全重复文件和重复候选，供上层按需使用
 
 ## 本地运行
 
@@ -55,4 +55,8 @@ make check
 
 ## 说明
 
-当前版本优先做高置信度检测，不会直接判定“未使用代码”。它更适合先定位 copy-paste、重复模块和样板热点，再由人或 agent 执行安全重构。
+当前版本的中心职责是“采集代码库 AST 事实”，而不是直接替 agent 做结论判断。
+
+- 已接入 AST 的语言：`rs`、`go`、`js`、`jsx`、`ts`、`tsx`、`py`
+- 其他扩展名目前仍会被扫描，但会标记为未支持 AST
+- `derived` 字段只是派生视图；是否用它做重复检测、架构分析或重构决策，由上层 agent 决定
