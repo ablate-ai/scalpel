@@ -3,22 +3,21 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "帮我扫描当前仓库，找出重复文件和明显 copy-paste 代码，然后告诉我应该先从哪里开始瘦身。",
-      "expected_output": "调用 Scalpel 扫描器，对当前仓库做扫描，输出重复文件、重复代码片段和建议的处理顺序。",
+      "prompt": "先帮我分析一下这个仓库的模块结构、符号分布和主要调用关系，我想先理解代码库再决定怎么改。",
+      "expected_output": "触发 Scalpel，对当前仓库做 AST 扫描，优先汇总 files 中的语言、顶层节点、symbols、imports、calls 等主结果，而不是直接给重复代码结论。",
       "files": []
     },
     {
       "id": 2,
-      "prompt": "看一下 ./src/modules 和 ./src/services 里有没有重复实现的业务逻辑，列一个低风险重构计划。",
-      "expected_output": "扫描指定目录，识别跨目录重复代码，并给出可执行的低风险重构计划。",
+      "prompt": "帮我看看这个 Vue 项目的 template 层结构，哪些组件、元素、插值和指令最密集。",
+      "expected_output": "触发 Scalpel，优先读取 .vue 文件的 template_nodes，并结合 script/script setup 的符号和调用事实组织结果。",
       "files": []
     },
     {
       "id": 3,
-      "prompt": "这个项目越来越胖，帮我做一次代码瘦身体检，重点关注冗余样板代码。",
-      "expected_output": "扫描项目中的样板冗余热点，给出按优先级排序的瘦身建议。",
+      "prompt": "扫一下 services 目录，先给我代码事实，再顺带说说 derived 里有没有明显重复候选可以后续处理。",
+      "expected_output": "触发 Scalpel，先输出目标目录的 files 主数据，再把 derived.clone_candidates 当作附加证据引用，而不是把重复候选当主结果。",
       "files": []
     }
   ]
 }
-
