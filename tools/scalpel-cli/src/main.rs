@@ -10,8 +10,8 @@ use tree_sitter::{Language, Node, Parser as TsParser};
 use walkdir::{DirEntry, WalkDir};
 
 const DEFAULT_EXTENSIONS: &[&str] = &[
-    "rs", "go", "js", "jsx", "ts", "tsx", "py", "java", "kt", "swift", "rb", "php", "c", "cc",
-    "cpp", "h", "hpp", "cs", "scala", "sql", "sh", "lua",
+    "rs", "go", "js", "jsx", "ts", "tsx", "py", "vue", "java", "kt", "swift", "rb", "php", "c",
+    "cc", "cpp", "h", "hpp", "cs", "scala", "sql", "sh", "lua",
 ];
 
 const DEFAULT_EXCLUDES: &[&str] = &[
@@ -65,7 +65,16 @@ enum LanguageKind {
     Tsx,
     Python,
     Go,
+    Vue,
 }
+
+impl PartialEq for LanguageKind {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
+impl Eq for LanguageKind {}
 
 impl LanguageKind {
     fn from_extension(path: &Path) -> Option<Self> {
@@ -76,6 +85,7 @@ impl LanguageKind {
             "tsx" => Some(Self::Tsx),
             "py" => Some(Self::Python),
             "go" => Some(Self::Go),
+            "vue" => Some(Self::Vue),
             _ => None,
         }
     }
@@ -88,6 +98,7 @@ impl LanguageKind {
             Self::Tsx => "tsx",
             Self::Python => "python",
             Self::Go => "go",
+            Self::Vue => "vue",
         }
     }
 
@@ -99,6 +110,7 @@ impl LanguageKind {
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
+            Self::Vue => unreachable!("vue 由 SFC 分块分析，不直接走单一 parser"),
         }
     }
 }
@@ -132,6 +144,7 @@ struct FileAnalysis {
     language: Option<String>,
     summary: FileSummary,
     top_level_nodes: Vec<NodeSummary>,
+    template_nodes: Vec<TemplateNodeFact>,
     symbols: Vec<SymbolFact>,
     imports: Vec<ImportFact>,
     exports: Vec<ExportFact>,
@@ -162,6 +175,16 @@ struct FileSummary {
     max_depth: usize,
 }
 
+#[derive(Debug)]
+struct VueBlock {
+    tag: String,
+    lang: Option<String>,
+    start_line: usize,
+    end_line: usize,
+    content_start_line: usize,
+    content: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CodebaseAnalysisReport {
     root: String,
@@ -182,6 +205,7 @@ struct FileFact {
     content_hash: String,
     summary: FileSummaryFact,
     top_level_nodes: Vec<NodeSummary>,
+    template_nodes: Vec<TemplateNodeFact>,
     symbols: Vec<SymbolFact>,
     imports: Vec<ImportFact>,
     exports: Vec<ExportFact>,
@@ -193,6 +217,7 @@ struct FileFact {
 struct FileSummaryFact {
     total_named_nodes: usize,
     max_depth: usize,
+    template_node_count: usize,
     symbol_count: usize,
     import_count: usize,
     export_count: usize,
@@ -204,6 +229,17 @@ struct NodeSummary {
     kind: String,
     start_line: usize,
     end_line: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TemplateNodeFact {
+    kind: String,
+    name: Option<String>,
+    directives: Vec<String>,
+    attributes: Vec<String>,
+    expression: Option<String>,
+    depth: usize,
+    span: Span,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -416,7 +452,13 @@ fn load_file(
         return Ok(None);
     }
 
-    let relative = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    let relative = if root.is_file() {
+        path.file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.strip_prefix(root).unwrap_or(path).to_path_buf()
+    };
     let language = LanguageKind::from_extension(path);
     let (analysis, ast_spans) = analyze_file(&content, &relative, language, min_lines, min_chars);
 
@@ -436,32 +478,52 @@ fn analyze_file(
     min_lines: usize,
     min_chars: usize,
 ) -> (FileAnalysis, Vec<AstSpanRecord>) {
-    let mut diagnostics = Vec::new();
     let analysis_language = language.map(|lang| lang.as_str().to_string());
 
-    let Some(language) = language else {
-        diagnostics.push(AnalysisDiagnostic {
-            level: "info".to_string(),
-            message: "当前版本未接入该语言的 tree-sitter parser".to_string(),
-        });
-        return (
+    match language {
+        None => (
             FileAnalysis {
                 parse_status: ParseStatus::Unsupported,
                 language: analysis_language,
                 summary: FileSummary::default(),
                 top_level_nodes: Vec::new(),
+                template_nodes: Vec::new(),
                 symbols: Vec::new(),
                 imports: Vec::new(),
                 exports: Vec::new(),
                 calls: Vec::new(),
-                diagnostics,
+                diagnostics: vec![AnalysisDiagnostic {
+                    level: "info".to_string(),
+                    message: "当前版本未接入该语言的 tree-sitter parser".to_string(),
+                }],
             },
             Vec::new(),
-        );
-    };
+        ),
+        Some(LanguageKind::Vue) => analyze_vue_file(content, relative, min_lines, min_chars),
+        Some(language) => analyze_with_parser(
+            content,
+            relative,
+            language,
+            language.as_str().to_string(),
+            0,
+            min_lines,
+            min_chars,
+        ),
+    }
+}
 
+fn analyze_with_parser(
+    content: &str,
+    relative: &Path,
+    parser_language: LanguageKind,
+    reported_language: String,
+    line_offset: usize,
+    min_lines: usize,
+    min_chars: usize,
+) -> (FileAnalysis, Vec<AstSpanRecord>) {
+    let mut diagnostics = Vec::new();
     let mut parser = TsParser::new();
-    if let Err(err) = parser.set_language(&language.parser_language()) {
+    if let Err(err) = parser.set_language(&parser_language.parser_language()) {
         diagnostics.push(AnalysisDiagnostic {
             level: "error".to_string(),
             message: format!("parser 初始化失败: {err}"),
@@ -469,9 +531,10 @@ fn analyze_file(
         return (
             FileAnalysis {
                 parse_status: ParseStatus::ParseError,
-                language: analysis_language,
+                language: Some(reported_language),
                 summary: FileSummary::default(),
                 top_level_nodes: Vec::new(),
+                template_nodes: Vec::new(),
                 symbols: Vec::new(),
                 imports: Vec::new(),
                 exports: Vec::new(),
@@ -490,9 +553,10 @@ fn analyze_file(
         return (
             FileAnalysis {
                 parse_status: ParseStatus::ParseError,
-                language: analysis_language,
+                language: Some(reported_language),
                 summary: FileSummary::default(),
                 top_level_nodes: Vec::new(),
+                template_nodes: Vec::new(),
                 symbols: Vec::new(),
                 imports: Vec::new(),
                 exports: Vec::new(),
@@ -512,6 +576,7 @@ fn analyze_file(
     }
 
     let mut top_level_nodes = Vec::new();
+    let template_nodes = Vec::new();
     let mut symbols = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
@@ -523,7 +588,7 @@ fn analyze_file(
         root,
         content.as_bytes(),
         relative,
-        language,
+        parser_language,
         min_lines,
         min_chars,
         0,
@@ -536,12 +601,135 @@ fn analyze_file(
         &mut ast_spans,
     );
 
+    if line_offset > 0 {
+        offset_node_summaries(&mut top_level_nodes, line_offset);
+        offset_symbols(&mut symbols, line_offset);
+        offset_imports(&mut imports, line_offset);
+        offset_exports(&mut exports, line_offset);
+        offset_calls(&mut calls, line_offset);
+        offset_ast_spans(&mut ast_spans, line_offset);
+    }
+
     (
         FileAnalysis {
             parse_status: ParseStatus::Parsed,
-            language: analysis_language,
+            language: Some(reported_language),
             summary,
             top_level_nodes,
+            template_nodes,
+            symbols,
+            imports,
+            exports,
+            calls,
+            diagnostics,
+        },
+        ast_spans,
+    )
+}
+
+fn analyze_vue_file(
+    content: &str,
+    relative: &Path,
+    min_lines: usize,
+    min_chars: usize,
+) -> (FileAnalysis, Vec<AstSpanRecord>) {
+    let mut diagnostics = Vec::new();
+    let blocks = extract_vue_blocks(content);
+    if blocks.is_empty() {
+        diagnostics.push(AnalysisDiagnostic {
+            level: "warning".to_string(),
+            message: "未识别到任何 Vue SFC block，已作为空文件处理".to_string(),
+        });
+        return (
+            FileAnalysis {
+                parse_status: ParseStatus::ParseError,
+                language: Some("vue".to_string()),
+                summary: FileSummary::default(),
+                top_level_nodes: Vec::new(),
+                template_nodes: Vec::new(),
+                symbols: Vec::new(),
+                imports: Vec::new(),
+                exports: Vec::new(),
+                calls: Vec::new(),
+                diagnostics,
+            },
+            Vec::new(),
+        );
+    }
+
+    let mut summary = FileSummary::default();
+    let mut top_level_nodes = Vec::new();
+    let mut template_nodes = Vec::new();
+    let mut symbols = Vec::new();
+    let mut imports = Vec::new();
+    let mut exports = Vec::new();
+    let mut calls = Vec::new();
+    let mut ast_spans = Vec::new();
+    let mut parsed_any_script = false;
+
+    for block in blocks {
+        top_level_nodes.push(NodeSummary {
+            kind: format!("vue_{}", block.tag),
+            start_line: block.start_line,
+            end_line: block.end_line,
+        });
+
+        match block.tag.as_str() {
+            "script" => {
+                let script_lang = match block.lang.as_deref() {
+                    Some("ts") | Some("tsx") => LanguageKind::TypeScript,
+                    Some("jsx") => LanguageKind::JavaScript,
+                    _ => LanguageKind::JavaScript,
+                };
+                let (block_analysis, block_spans) = analyze_with_parser(
+                    &block.content,
+                    relative,
+                    script_lang,
+                    "vue".to_string(),
+                    block.content_start_line.saturating_sub(1),
+                    min_lines,
+                    min_chars,
+                );
+                parsed_any_script = true;
+                merge_summary(&mut summary, &block_analysis.summary);
+                top_level_nodes.extend(block_analysis.top_level_nodes);
+                symbols.extend(block_analysis.symbols);
+                imports.extend(block_analysis.imports);
+                exports.extend(block_analysis.exports);
+                calls.extend(block_analysis.calls);
+                diagnostics.extend(block_analysis.diagnostics);
+                ast_spans.extend(block_spans);
+            }
+            "template" => {
+                template_nodes.extend(analyze_vue_template_block(&block));
+            }
+            "style" => {
+                diagnostics.push(AnalysisDiagnostic {
+                    level: "info".to_string(),
+                    message: format!(
+                        "style block 已识别，当前版本不做样式 AST 提取 ({}-{})",
+                        block.start_line, block.end_line
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if !parsed_any_script {
+        diagnostics.push(AnalysisDiagnostic {
+            level: "warning".to_string(),
+            message: "Vue 文件未包含可解析的 script/script setup block".to_string(),
+        });
+    }
+
+    (
+        FileAnalysis {
+            parse_status: ParseStatus::Parsed,
+            language: Some("vue".to_string()),
+            summary,
+            top_level_nodes,
+            template_nodes,
             symbols,
             imports,
             exports,
@@ -649,7 +837,14 @@ fn extract_symbol(node: Node<'_>, source: &[u8]) -> Option<SymbolFact> {
 
 fn extract_import(node: Node<'_>, source: &[u8]) -> Option<ImportFact> {
     let kind = node.kind();
-    if !kind.contains("import") && kind != "use_declaration" && kind != "import_statement" {
+    if !matches!(
+        kind,
+        "use_declaration"
+            | "import_statement"
+            | "import_declaration"
+            | "import_from_statement"
+            | "namespace_import"
+    ) {
         return None;
     }
 
@@ -847,6 +1042,285 @@ fn collect_named_descendants_inner<F>(
     }
 }
 
+fn merge_summary(target: &mut FileSummary, source: &FileSummary) {
+    target.total_named_nodes += source.total_named_nodes;
+    target.max_depth = target.max_depth.max(source.max_depth);
+}
+
+fn offset_node_summaries(items: &mut [NodeSummary], line_offset: usize) {
+    for item in items {
+        item.start_line += line_offset;
+        item.end_line += line_offset;
+    }
+}
+
+fn offset_symbols(items: &mut [SymbolFact], line_offset: usize) {
+    for item in items {
+        item.span.start_line += line_offset;
+        item.span.end_line += line_offset;
+    }
+}
+
+fn offset_imports(items: &mut [ImportFact], line_offset: usize) {
+    for item in items {
+        item.span.start_line += line_offset;
+        item.span.end_line += line_offset;
+    }
+}
+
+fn offset_exports(items: &mut [ExportFact], line_offset: usize) {
+    for item in items {
+        item.span.start_line += line_offset;
+        item.span.end_line += line_offset;
+    }
+}
+
+fn offset_calls(items: &mut [CallFact], line_offset: usize) {
+    for item in items {
+        item.span.start_line += line_offset;
+        item.span.end_line += line_offset;
+    }
+}
+
+fn offset_ast_spans(items: &mut [AstSpanRecord], line_offset: usize) {
+    for item in items {
+        item.start_line += line_offset;
+        item.end_line += line_offset;
+    }
+}
+
+fn extract_vue_blocks(content: &str) -> Vec<VueBlock> {
+    let mut blocks = Vec::new();
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim();
+        if let Some((tag, lang)) = parse_vue_open_tag(trimmed) {
+            let start_line = idx + 1;
+            let mut content_lines = Vec::new();
+            let mut end_line = start_line;
+            idx += 1;
+
+            while idx < lines.len() {
+                let line = lines[idx];
+                if line.trim().starts_with(&format!("</{tag}>")) {
+                    end_line = idx + 1;
+                    break;
+                }
+                content_lines.push(line);
+                idx += 1;
+            }
+
+            blocks.push(VueBlock {
+                tag,
+                lang,
+                start_line,
+                end_line,
+                content_start_line: start_line + 1,
+                content: content_lines.join("\n"),
+            });
+        }
+        idx += 1;
+    }
+
+    blocks
+}
+
+fn analyze_vue_template_block(block: &VueBlock) -> Vec<TemplateNodeFact> {
+    let mut nodes = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+
+    for (idx, raw_line) in block.content.lines().enumerate() {
+        let line_no = block.content_start_line + idx;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let interpolations = extract_interpolations(raw_line);
+        for expr in interpolations {
+            nodes.push(TemplateNodeFact {
+                kind: "interpolation".to_string(),
+                name: None,
+                directives: Vec::new(),
+                attributes: Vec::new(),
+                expression: Some(expr),
+                depth: stack.len(),
+                span: Span {
+                    start_line: line_no,
+                    end_line: line_no,
+                },
+            });
+        }
+
+        let mut cursor = 0usize;
+        while let Some(start) = raw_line[cursor..].find('<') {
+            let start_idx = cursor + start;
+            let rest = &raw_line[start_idx..];
+            let Some(end_rel) = rest.find('>') else {
+                break;
+            };
+            let tag_text = &rest[..=end_rel];
+            cursor = start_idx + end_rel + 1;
+
+            if tag_text.starts_with("</") {
+                if !stack.is_empty() {
+                    stack.pop();
+                }
+                continue;
+            }
+            if tag_text.starts_with("<!--") || tag_text.starts_with("<!") {
+                continue;
+            }
+
+            if let Some(tag) = parse_template_tag(tag_text) {
+                let depth = stack.len();
+                let node_kind = if is_component_name(&tag.name) {
+                    "component"
+                } else {
+                    "element"
+                };
+                nodes.push(TemplateNodeFact {
+                    kind: node_kind.to_string(),
+                    name: Some(tag.name.clone()),
+                    directives: tag.directives,
+                    attributes: tag.attributes,
+                    expression: None,
+                    depth,
+                    span: Span {
+                        start_line: line_no,
+                        end_line: line_no,
+                    },
+                });
+                if !tag.self_closing {
+                    stack.push(tag.name);
+                }
+            }
+        }
+    }
+
+    nodes
+}
+
+#[derive(Debug)]
+struct ParsedTemplateTag {
+    name: String,
+    directives: Vec<String>,
+    attributes: Vec<String>,
+    self_closing: bool,
+}
+
+fn parse_template_tag(tag_text: &str) -> Option<ParsedTemplateTag> {
+    let inner = tag_text
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim_end_matches('/')
+        .trim();
+    if inner.is_empty() {
+        return None;
+    }
+
+    let mut parts = inner.split_whitespace();
+    let name = parts.next()?.trim_matches('/').to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut directives = Vec::new();
+    let mut attributes = Vec::new();
+    for token in parts {
+        let attr = token
+            .trim_end_matches('/')
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if attr.is_empty() {
+            continue;
+        }
+        if is_template_directive(attr) {
+            directives.push(attr.to_string());
+        } else {
+            attributes.push(attr.to_string());
+        }
+    }
+
+    Some(ParsedTemplateTag {
+        name,
+        directives,
+        attributes,
+        self_closing: tag_text.trim_end().ends_with("/>"),
+    })
+}
+
+fn is_component_name(name: &str) -> bool {
+    name.contains('-')
+        || name
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+}
+
+fn is_template_directive(attr: &str) -> bool {
+    attr.starts_with("v-")
+        || attr.starts_with(':')
+        || attr.starts_with('@')
+        || attr.starts_with('#')
+}
+
+fn extract_interpolations(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(start_rel) = line[cursor..].find("{{") {
+        let start = cursor + start_rel + 2;
+        let Some(end_rel) = line[start..].find("}}") else {
+            break;
+        };
+        let end = start + end_rel;
+        let expr = line[start..end].trim();
+        if !expr.is_empty() {
+            out.push(expr.to_string());
+        }
+        cursor = end + 2;
+    }
+    out
+}
+
+fn parse_vue_open_tag(line: &str) -> Option<(String, Option<String>)> {
+    let tag = if line.starts_with("<template") {
+        "template"
+    } else if line.starts_with("<script") {
+        "script"
+    } else if line.starts_with("<style") {
+        "style"
+    } else {
+        return None;
+    };
+
+    Some((tag.to_string(), extract_lang_attr(line)))
+}
+
+fn extract_lang_attr(line: &str) -> Option<String> {
+    let marker = "lang=";
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let mut chars = rest.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+
+    let value = chars.take_while(|ch| *ch != quote).collect::<String>();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 fn span_of(node: Node<'_>) -> Span {
     Span {
         start_line: node.start_position().row + 1,
@@ -967,12 +1441,14 @@ fn to_file_fact(file: &FileRecord) -> FileFact {
         summary: FileSummaryFact {
             total_named_nodes: file.analysis.summary.total_named_nodes,
             max_depth: file.analysis.summary.max_depth,
+            template_node_count: file.analysis.template_nodes.len(),
             symbol_count: file.analysis.symbols.len(),
             import_count: file.analysis.imports.len(),
             export_count: file.analysis.exports.len(),
             call_count: file.analysis.calls.len(),
         },
         top_level_nodes: file.analysis.top_level_nodes.clone(),
+        template_nodes: file.analysis.template_nodes.clone(),
         symbols: file.analysis.symbols.clone(),
         imports: file.analysis.imports.clone(),
         exports: file.analysis.exports.clone(),
@@ -1190,10 +1666,11 @@ fn render_markdown(report: &CodebaseAnalysisReport) -> String {
     } else {
         for file in &report.files {
             out.push_str(&format!(
-                "- `{}`: language=`{}` status=`{}` symbols=`{}` imports=`{}` exports=`{}` calls=`{}` nodes=`{}`\n",
+                "- `{}`: language=`{}` status=`{}` template_nodes=`{}` symbols=`{}` imports=`{}` exports=`{}` calls=`{}` nodes=`{}`\n",
                 file.path,
                 file.language.as_deref().unwrap_or("unknown"),
                 file.parse_status,
+                file.summary.template_node_count,
                 file.summary.symbol_count,
                 file.summary.import_count,
                 file.summary.export_count,
@@ -1215,6 +1692,21 @@ fn render_markdown(report: &CodebaseAnalysisReport) -> String {
                     out.push_str(&format!(
                         "    - `{}` `{}` {}-{}\n",
                         symbol.kind, symbol.name, symbol.span.start_line, symbol.span.end_line
+                    ));
+                }
+            }
+            if !file.template_nodes.is_empty() {
+                out.push_str("  - Template 节点样本:\n");
+                for node in file.template_nodes.iter().take(6) {
+                    out.push_str(&format!(
+                        "    - `{}` name=`{}` depth=`{}` directives=`{}` expr=`{}` {}-{}\n",
+                        node.kind,
+                        node.name.as_deref().unwrap_or("-"),
+                        node.depth,
+                        node.directives.join(", "),
+                        node.expression.as_deref().unwrap_or("-"),
+                        node.span.start_line,
+                        node.span.end_line
                     ));
                 }
             }
